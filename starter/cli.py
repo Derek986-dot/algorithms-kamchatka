@@ -15,8 +15,8 @@ REASONS = {
 }
 
 
-def load_scenario(mode: str) -> tuple[Scenario, str]:
-    data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
+def load_scenario(mode: str, data_path: Path = DATA_PATH) -> tuple[Scenario, str]:
+    data = json.loads(data_path.read_text(encoding="utf-8"))
     fleet = tuple(
         Vehicle(**vehicle)
         for vehicle in data["fleet"]
@@ -72,8 +72,12 @@ def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description="Сравнение планов уборки одной смены")
     parser.add_argument("--team", choices=TEAM_NAMES, help="Команда для сравнения с базовым планом")
     parser.add_argument("--scenario", choices=("normal", "no_compact"), default="normal")
+    parser.add_argument("--data", type=Path, default=DATA_PATH, help="Путь к JSON со сценарием")
     args = parser.parse_args(argv)
-    scenario, start_time = load_scenario(args.scenario)
+    try:
+        scenario, start_time = load_scenario(args.scenario, args.data)
+    except (OSError, KeyError, ValueError, TypeError) as error:
+        parser.error(f"Не удалось загрузить сценарий {args.data}: {error}")
     mode = "малая машина отсутствует" if args.scenario == "no_compact" else "полный парк"
     print(f"{scenario.name} · {mode}")
     print(f"Срок открытия критического проезда · {clock(start_time, scenario.access_deadline)}")

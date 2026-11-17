@@ -1,9 +1,12 @@
 import contextlib
 import io
 import importlib
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
-from starter.cli import TEAM_NAMES, load_scenario, main
+from starter.cli import DATA_PATH, TEAM_NAMES, load_scenario, main
 from starter.model import Job, Scenario, Vehicle, run_plan
 
 
@@ -96,6 +99,22 @@ class EntryPointTests(unittest.TestCase):
                         main(["--team", f"team_{number:02}", "--scenario", scenario])
                     self.assertIn("Базовый план", output.getvalue())
                     self.assertIn(f"План team_{number:02}", output.getvalue())
+
+    def test_cli_uses_a_scenario_generated_by_a_team(self):
+        data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
+        data["name"] = "Сценарий команды"
+        data["transit_seconds"][0][2] = None
+        data["access_deadline_seconds"] = 30
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "team-scenario.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            with contextlib.redirect_stdout(output):
+                main(["--team", "team_01", "--data", str(path)])
+        result = output.getvalue()
+        self.assertIn("Сценарий команды", result)
+        self.assertIn("06:00:30", result)
+        self.assertIn("Критический проезд · 06:43:00", result)
 
     def test_baseline_can_run_without_a_team(self):
         output = io.StringIO()

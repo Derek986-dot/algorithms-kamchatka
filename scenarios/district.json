@@ -5,7 +5,7 @@
   "access_deadline_seconds": 2100,
   "access_jobs": ["approach", "narrow_gate"],
   "coordinates_lon_lat": [[158.645, 53.025], [158.657, 53.051], [158.674, 53.056]],
-  "transit_seconds": [[0, 334.7, 467.3], [298.2, 0, 156], [461.6, 162, 0]],
+  "transit_seconds": [[0, 360, 480], [300, 0, 180], [450, 180, 0]],
   "fleet": [
     {"id": "М1", "type": "wide", "start": 0},
     {"id": "М2", "type": "compact", "start": 0}
