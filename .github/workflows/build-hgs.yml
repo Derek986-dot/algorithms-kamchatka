@@ -1,0 +1,24 @@
+name: build-hgs
+on:
+  push:
+    paths: ["teams/team_05/hgs/**", ".github/workflows/build-hgs.yml"]
+  workflow_dispatch:
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults: { run: { working-directory: teams/team_05/hgs/core } }
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -A x64
+      - run: cmake --build build --config Release
+      - uses: actions/upload-artifact@v4
+        with: { name: hgs-windows, path: teams/team_05/hgs/core/build/Release/hgs.exe }
+  linux:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: teams/team_05/hgs/core } }
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build -j
+      - uses: actions/upload-artifact@v4
+        with: { name: hgs-linux, path: teams/team_05/hgs/core/build/hgs }
