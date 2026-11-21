@@ -106,6 +106,7 @@ Instance loadInstance(const std::string& text) {
         q.popMin = (int)p->getNum("pop_min", q.popMin);
         q.popGen = (int)p->getNum("pop_gen", q.popGen);
         q.maxIterNoImprove = (int)p->getNum("max_iter_no_improve", q.maxIterNoImprove);
+        q.stopOnStagnation = p->find("max_iter_no_improve") != nullptr;
         q.granularK = (int)p->getNum("granular_k", q.granularK);
         q.nbElite = (int)p->getNum("nb_elite", q.nbElite);
         q.nbClose = (int)p->getNum("nb_close", q.nbClose);

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 
@@ -34,9 +35,19 @@ struct Rng {
 
 struct Ev { double cost, ret; };
 
+// Per-position data of a route. Node: what an exact re-walk of the suffix needs (task constants copied for
+// sequential access). Head: Phi_i(arr) = cost of tasks i.. (excluding arc into i, return leg and overtime) as a
+// piecewise-linear function of the arrival time at task i: sc = Phi_i(arr), gR/gL = right/left slope, uR/dL = how far
+// arr may increase/decrease with the slope still exact, sR/sL = slope of the end-of-last-task time wrt arr.
+struct Node { double arr, e, arcc, r, lw, dl, dw, s; };
+struct Head { double sc, gR, gL, uR, dL, sR, sL; };
+
 struct Route {
     std::vector<int> seq;
     std::vector<double> tm, pc; // time / partial weighted cost after i tasks (size len+1)
+    std::vector<Node> nd;
+    std::vector<Head> hd;
+    std::vector<int> lastBad;   // per class: last position of a task the class cannot serve (-1: none)
     double cost = 0, ret = -1;  // ret < 0 => empty route
 };
 
@@ -54,6 +65,8 @@ struct Model {
     std::vector<std::vector<int>> vehOfClass;  // vehicles per class (ascending)
     std::vector<int> vorder;                   // vehicles ordered by class then index
     std::vector<int> twin;                     // identical-vehicle group id
+    std::vector<int> sgrp;                     // suffix-compatibility group (= class)
+    double wm_dummy = 0;
     std::vector<std::vector<int>> nbr;         // granular neighbours (task ids)
 
     explicit Model(const Instance& i) : in(i) {
@@ -86,6 +99,17 @@ struct Model {
                 if (twin[b] < 0 && vcls[a] == vcls[b] && vsn[a] == vsn[b] && ven[a] == ven[b] && vss[a] == vss[b] && vse[a] == vse[b])
                     twin[b] = g;
             ++g;
+        }
+        sgrp.assign(V, -1);
+        {
+            int gg = 0;
+            for (int a = 0; a < V; ++a) {
+                if (sgrp[a] >= 0) continue;
+                sgrp[a] = gg;
+                for (int b = a + 1; b < V; ++b)
+                    if (sgrp[b] < 0 && vcls[a] == vcls[b]) sgrp[b] = gg;
+                ++gg;
+            }
         }
         ctask.assign(T, {});
         for (int t = 0; t < T; ++t) {
@@ -123,7 +147,8 @@ struct Model {
     void fill(int v, Route& r) const {
         int len = (int)r.seq.size();
         r.tm.assign(len + 1, 0.0); r.pc.assign(len + 1, 0.0);
-        if (len == 0) { r.cost = 0; r.ret = -1; return; }
+        if (len == 0) { r.cost = 0; r.ret = -1; r.nd.clear(); r.hd.clear(); return; }
+        r.nd.resize(len); r.hd.resize(len);
         const double* Dm = in.mat[vcls[v]].data();
         const double* sv = &svcV[(size_t)v * T];
         double t = vss[v], c = 0; int pos = vsn[v];
@@ -133,16 +158,40 @@ struct Model {
             double arr = t + Dm[(size_t)pos * N + tsn[x]];
             double st = arr < tr[x] ? tr[x] : arr;
             double e = st + sv[x];
+            Node& nd = r.nd[i];
+            nd.arr = arr; nd.e = e; nd.arcc = wd * (arr - t); nd.r = tr[x]; nd.lw = wl * tw[x]; nd.dl = tdl[x]; nd.dw = tdw[x]; nd.s = sv[x];
             c += wd * (arr - t) + ww * (st - arr) + wl * tw[x] * e;
             if (e > tdl[x]) c += tdw[x] * (e - tdl[x]);
             t = e; pos = ten[x];
             r.tm[i + 1] = t; r.pc[i + 1] = c;
         }
         double leg = Dm[(size_t)pos * N + ven[v]];
-        t += leg; c += wd * leg;
-        double ot = t - vse[v];
-        if (ot > 0) c += wo * ot;
-        r.cost = c; r.ret = t;
+        double tr_ = t + leg, cc = c + wd * leg;
+        double ot = tr_ - vse[v];
+        if (ot > 0) cc += wo * ot;
+        r.cost = cc; r.ret = tr_;
+        // backward pass: suffix slopes and linearity ranges
+        const double BIG = 1e300;
+        double gR = 0.0, uR = BIG, gL = 0.0, dL = BIG, sR = 1.0, sL = 1.0;
+        for (int i = len - 1; i >= 0; --i) {
+            const Node& nd = r.nd[i];
+            Head& h = r.hd[i];
+            double arr = nd.arr, e = nd.e;
+            if (arr < nd.r) { gR = -ww; uR = nd.r - arr; sR = 0.0; }
+            else {
+                double dlk = e < nd.dl ? nd.dl - e : BIG;
+                gR = nd.lw + (e >= nd.dl ? nd.dw : 0.0) + gR;
+                uR = std::min(dlk, uR);
+            }
+            if (arr <= nd.r) { gL = -ww; dL = BIG; sL = 0.0; }
+            else {
+                double dk = e > nd.dl ? e - nd.dl : BIG;
+                dL = std::min(std::min(arr - nd.r, dk), dL);
+                gL = nd.lw + (e > nd.dl ? nd.dw : 0.0) + gL;
+            }
+            h.gR = gR; h.uR = uR; h.gL = gL; h.dL = dL; h.sR = sR; h.sL = sL;
+            h.sc = r.pc[len] - r.pc[i] - nd.arcc;
+        }
     }
 
     double corr(int u, int v) const { // task proximity (smaller = closer)
@@ -254,8 +303,17 @@ struct Model {
         return s + wm * mx;
     }
 };
-
 // ---------------- Local search ----------------
+// A candidate route is described without materialising it:
+//   own-route prefix [0,p) + up to 3 chunks of tasks + suffix R[s].seq[q..).
+struct Chunk { const int* p; int n; int step; };
+struct Spec {
+    int v, p;
+    Chunk ch[3];
+    int nch;
+    int s, q; // suffix source route (-1: none) and first suffix position
+};
+
 struct LS {
     const Model& m;
     Rng& rng;
@@ -268,9 +326,14 @@ struct LS {
     long long ctr = 0;
     std::vector<long long> modAt, lastTest;
     bool timeUp = false;
+    size_t kLimit = 1000000;
+    bool useIntraAll = false;
+    int remU = -1; long long remMod = -1; bool remOk[3] = {false, false, false}; Ev remEv[3];
+    std::vector<long long> lastIntra;
 
-    LS(const Model& mm, Rng& r, Clock::time_point dl) : m(mm), rng(r), deadline(dl) {
-        rid.assign(m.T, -1); idx.assign(m.T, 0); stamp.assign(m.V, 0); lastTest.assign(m.T, -1); modAt.assign(m.V, 0);
+    LS(const Model& mm, Rng& r) : m(mm), rng(r) {
+        rid.assign(m.T, -1); idx.assign(m.T, 0); stamp.assign(m.V, 0); lastIntra.assign(m.T, -1); lastTest.assign(m.T, -1); modAt.assign(m.V, 0);
+        R.resize(m.V);
     }
 
     void recomputeMax() {
@@ -286,14 +349,121 @@ struct LS {
         R[v].seq = s;
         modAt[v] = ++ctr;
         m.fill(v, R[v]);
+        R[v].lastBad.assign(m.C, -1);
+        for (int i = 0; i < (int)s.size(); ++i)
+            for (int c = 0; c < m.C; ++c) if (m.in.tasks[s[i]].svc[c] < 0) R[v].lastBad[c] = i;
         for (int i = 0; i < (int)s.size(); ++i) { rid[s[i]] = v; idx[s[i]] = i; }
     }
-    void load(const std::vector<std::vector<int>>& routes) {
-        R.assign(m.V, Route());
+    void load(const std::vector<std::vector<int>>& routes, Clock::time_point dl) {
+        remU = -1; deadline = dl; timeUp = false; ctr = 0; stampCtr = 0;
+        std::fill(lastTest.begin(), lastTest.end(), -1LL);
+        std::fill(lastIntra.begin(), lastIntra.end(), -1LL);
+        std::fill(modAt.begin(), modAt.end(), 0LL);
+        std::fill(stamp.begin(), stamp.end(), 0);
         for (int v = 0; v < m.V; ++v) setRoute(v, routes[v]);
         recomputeMax();
     }
     Ev sim(int v, const std::vector<int>& s, int k) const { return m.simulate(v, s.data(), (int)s.size(), k, R[v]); }
+
+    // ---- fast move evaluation ----
+    void materialize(const Spec& sp, std::vector<int>& out) const {
+        const std::vector<int>& P = R[sp.v].seq;
+        out.assign(P.begin(), P.begin() + sp.p);
+        for (int c = 0; c < sp.nch; ++c) {
+            const Chunk& ch = sp.ch[c];
+            for (int k = 0; k < ch.n; ++k) out.push_back(ch.p[(long)k * ch.step]);
+        }
+        if (sp.s >= 0) { const std::vector<int>& S = R[sp.s].seq; out.insert(out.end(), S.begin() + sp.q, S.end()); }
+    }
+
+    Ev evalSpec(const Spec& sp) const {
+        const int v = sp.v;
+        const Route& P = R[v];
+        const int N = m.N;
+        const double* Dm = m.in.mat[m.vcls[v]].data();
+        const double* sv = &m.svcV[(size_t)v * m.T];
+        const double wd = m.wd, ww = m.ww, wl = m.wl;
+        int sufLen = 0;
+        if (sp.s >= 0) sufLen = (int)R[sp.s].seq.size() - sp.q;
+        int tot = sp.p + sufLen;
+        for (int c = 0; c < sp.nch; ++c) tot += sp.ch[c].n;
+        if (tot == 0) return Ev{0.0, -1.0};
+        double t, c; int pos;
+        if (sp.p == 0) { t = m.vss[v]; c = 0; pos = m.vsn[v]; }
+        else { t = P.tm[sp.p]; c = P.pc[sp.p]; pos = m.ten[P.seq[sp.p - 1]]; }
+        for (int ci = 0; ci < sp.nch; ++ci) {
+            const Chunk& ch = sp.ch[ci];
+            for (int k = 0; k < ch.n; ++k) {
+                int x = ch.p[(long)k * ch.step];
+                double arr = t + Dm[(size_t)pos * N + m.tsn[x]];
+                double st = arr < m.tr[x] ? m.tr[x] : arr;
+                double e = st + sv[x];
+                c += wd * (arr - t) + ww * (st - arr) + wl * m.tw[x] * e;
+                if (e > m.tdl[x]) c += m.tdw[x] * (e - m.tdl[x]);
+                t = e; pos = m.ten[x];
+            }
+        }
+        if (sufLen > 0) {
+            const Route& S = R[sp.s];
+            const int len = (int)S.seq.size();
+            if (m.wm == 0 && m.sgrp[v] == m.sgrp[sp.s]) {
+                const Node& n0 = S.nd[sp.q];
+                const Head& h0 = S.hd[sp.q];
+                int x0 = S.seq[sp.q];
+                double arrNew = t + Dm[(size_t)pos * N + m.tsn[x0]];
+                c += wd * (arrNew - t);
+                double dlt = arrNew - n0.arr;
+                double endT; // time at end of the last task
+                int lastEnd = m.ten[S.seq[len - 1]];
+                if (dlt == 0.0) { c += h0.sc; endT = S.tm[len]; }
+                else if (dlt > 0 && dlt <= h0.uR) { c += h0.sc + h0.gR * dlt; endT = S.tm[len] + h0.sR * dlt; }
+                else if (dlt < 0 && -dlt <= h0.dL) { c += h0.sc + h0.gL * dlt; endT = S.tm[len] + h0.sL * dlt; }
+                else {
+                    // exact walk over the suffix with early convergence
+                    double delta = dlt;
+                    int i = sp.q;
+                    endT = -1;
+                    for (; i < len; ++i) {
+                        const Node& ni = S.nd[i];
+                        if (i > sp.q) { // back inside a linear range: close the rest in O(1)
+                            const Head& hi = S.hd[i];
+                            if (delta > 0) {
+                                if (delta <= hi.uR) { c += ni.arcc + hi.sc + hi.gR * delta; endT = S.tm[len] + hi.sR * delta; break; }
+                            } else if (-delta <= hi.dL) { c += ni.arcc + hi.sc + hi.gL * delta; endT = S.tm[len] + hi.sL * delta; break; }
+                        }
+                        double arr = ni.arr + delta;
+                        double st = arr < ni.r ? ni.r : arr;
+                        double e = st + ni.s;
+                        if (i > sp.q) c += ni.arcc;
+                        c += ww * (st - arr) + ni.lw * e;
+                        if (e > ni.dl) c += ni.dw * (e - ni.dl);
+                        delta = e - ni.e;
+                        if (std::fabs(delta) < 1e-9) { c += S.pc[len] - S.pc[i + 1]; endT = S.tm[len]; break; }
+                        endT = e;
+                    }
+                }
+                double leg = Dm[(size_t)lastEnd * N + m.ven[v]];
+                c += wd * leg;
+                double ot = endT + leg - m.vse[v];
+                if (ot > 0) c += m.wo * ot;
+                return Ev{c, 0.0};
+            }
+            for (int i = sp.q; i < len; ++i) {
+                int x = S.seq[i];
+                double arr = t + Dm[(size_t)pos * N + m.tsn[x]];
+                double st = arr < m.tr[x] ? m.tr[x] : arr;
+                double e = st + sv[x];
+                c += wd * (arr - t) + ww * (st - arr) + wl * m.tw[x] * e;
+                if (e > m.tdl[x]) c += m.tdw[x] * (e - m.tdl[x]);
+                t = e; pos = m.ten[x];
+            }
+        }
+        double leg = Dm[(size_t)pos * N + m.ven[v]];
+        t += leg; c += wd * leg;
+        double ot = t - m.vse[v];
+        if (ot > 0) c += m.wo * ot;
+        return Ev{c, t};
+    }
 
     bool tryIntra(int r, const std::vector<int>& ns, int k) {
         Ev e = sim(r, ns, k);
@@ -309,33 +479,69 @@ struct LS {
         if (d < -EPS) { setRoute(a, na); setRoute(b, nb); recomputeMax(); return true; }
         return false;
     }
+#ifdef HGS_CHECK
+    void check(const Spec& s, const Ev& e, std::vector<int>& buf) {
+        materialize(s, buf);
+        Ev x = sim(s.v, buf, 0);
+        if (std::fabs(x.cost - e.cost) > 1e-6 * (1 + std::fabs(x.cost))) { std::fprintf(stderr, "MISMATCH fast %.9g exact %.9g\n", e.cost, x.cost); std::abort(); }
+        ++checked;
+    }
+    long long checked = 0;
+#endif
+    bool tryIntraSpec(const Spec& s) {
+        Ev e = evalSpec(s);
+#ifdef HGS_CHECK
+        check(s, e, t2);
+#endif
+        double d = e.cost - R[s.v].cost;
+        if (m.wm > 0) d += m.wm * (std::max(maxOthers(s.v, s.v), e.ret) - curMax);
+        if (d >= -EPS * 0.5) return false;
+        materialize(s, t1);
+        return tryIntra(s.v, t1, s.p);
+    }
+    bool tryInterSpec(const Spec& a, const Spec& b) { return tryInterEv(a, evalSpec(a), b); }
+    bool tryInterEv(const Spec& a, const Ev& ea, const Spec& b) {
+        Ev eb = evalSpec(b);
+#ifdef HGS_CHECK
+        check(a, ea, t1); check(b, eb, t1);
+#endif
+        double d = ea.cost + eb.cost - R[a.v].cost - R[b.v].cost;
+        if (m.wm > 0) d += m.wm * (std::max(maxOthers(a.v, b.v), std::max(ea.ret, eb.ret)) - curMax);
+        if (d >= -EPS * 0.5) return false;
+        materialize(a, t1); materialize(b, t2);
+        return tryInter(a.v, t1, a.p, b.v, t2, b.p);
+    }
     bool segOk(int v, const std::vector<int>& s, int p, int len) const {
         for (int i = p; i < p + len; ++i) if (!m.ok(v, s[i])) return false;
         return true;
     }
-    bool tailOk(int v, const std::vector<int>& s, int p) const {
-        for (int i = p; i < (int)s.size(); ++i) if (!m.ok(v, s[i])) return false;
-        return true;
-    }
+    // can vehicle v serve every task of route r from position p on?
+    bool tailOk(int v, int r, int p) const { return p > R[r].lastBad[m.vcls[v]]; }
+    static Spec mk(int v, int p, int s, int q) { Spec x; x.v = v; x.p = p; x.nch = 0; x.s = s; x.q = q; return x; }
+    static void add(Spec& x, const int* p, int n, int step = 1) { x.ch[x.nch].p = p; x.ch[x.nch].n = n; x.ch[x.nch].step = step; ++x.nch; }
 
     bool tryPair(int u, int v) {
         int ru = rid[u], rv = rid[v], pu = idx[u], pv = idx[v];
         const std::vector<int> &A = R[ru].seq, &B = R[rv].seq;
+        const int* Ad = A.data(); const int* Bd = B.data();
         int na = (int)A.size(), nb = (int)B.size();
         if (ru == rv) {
             // relocate segment starting at u before/after v
             for (int a = 1; a <= 2 && pu + a <= na; ++a) {
                 if (pv >= pu && pv < pu + a) continue;
-                t1.assign(A.begin(), A.begin() + pu);
-                t1.insert(t1.end(), A.begin() + pu + a, A.end());
                 int pvr = pv < pu ? pv : pv - a;
                 for (int side = 0; side < 2; ++side) {
                     int ins = pvr + side;
                     if (ins == pu) continue;
-                    t2.assign(t1.begin(), t1.begin() + ins);
-                    t2.insert(t2.end(), A.begin() + pu, A.begin() + pu + a);
-                    t2.insert(t2.end(), t1.begin() + ins, t1.end());
-                    if (tryIntra(ru, t2, std::min(pu, ins))) return true;
+                    Spec s;
+                    if (ins < pu) {
+                        s = mk(ru, ins, ru, pu + a);
+                        add(s, Ad + pu, a); add(s, Ad + ins, pu - ins);
+                    } else {
+                        s = mk(ru, pu, ru, ins + a);
+                        add(s, Ad + pu + a, ins - pu); add(s, Ad + pu, a);
+                    }
+                    if (tryIntraSpec(s)) return true;
                 }
             }
             // swap segments
@@ -344,62 +550,73 @@ struct LS {
                     int i, ai, j, bj;
                     if (pu < pv) { i = pu; ai = a; j = pv; bj = b; } else { i = pv; ai = b; j = pu; bj = a; }
                     if (i + ai > j || j + bj > na) continue;
-                    t1.assign(A.begin(), A.begin() + i);
-                    t1.insert(t1.end(), A.begin() + j, A.begin() + j + bj);
-                    t1.insert(t1.end(), A.begin() + i + ai, A.begin() + j);
-                    t1.insert(t1.end(), A.begin() + i, A.begin() + i + ai);
-                    t1.insert(t1.end(), A.begin() + j + bj, A.end());
-                    if (tryIntra(ru, t1, i)) return true;
+                    Spec s = mk(ru, i, ru, j + bj);
+                    add(s, Ad + j, bj); add(s, Ad + i + ai, j - i - ai); add(s, Ad + i, ai);
+                    if (tryIntraSpec(s)) return true;
                 }
             // 2-opt: reverse (lo, hi]
             int lo = std::min(pu, pv), hi = std::max(pu, pv);
             if (hi > lo + 1) {
-                t1.assign(A.begin(), A.end());
-                std::reverse(t1.begin() + lo + 1, t1.begin() + hi + 1);
-                if (tryIntra(ru, t1, lo + 1)) return true;
+                Spec s = mk(ru, lo + 1, ru, hi + 1);
+                add(s, Ad + hi, hi - lo, -1);
+                if (tryIntraSpec(s)) return true;
             }
             return false;
         }
         // ---- inter-route ----
+        if (remU != u || remMod != modAt[ru]) { remU = u; remMod = modAt[ru]; remOk[1] = remOk[2] = false; }
         for (int a = 1; a <= 2 && pu + a <= na; ++a) {
             if (!segOk(rv, A, pu, a)) continue;
-            t1.assign(A.begin(), A.begin() + pu);
-            t1.insert(t1.end(), A.begin() + pu + a, A.end());
+            Spec sa = mk(ru, pu, ru, pu + a);
+            if (!remOk[a]) { remEv[a] = evalSpec(sa); remOk[a] = true; }
             for (int side = 0; side < 2; ++side) {
                 int ins = pv + side;
-                t2.assign(B.begin(), B.begin() + ins);
-                t2.insert(t2.end(), A.begin() + pu, A.begin() + pu + a);
-                t2.insert(t2.end(), B.begin() + ins, B.end());
-                if (tryInter(ru, t1, pu, rv, t2, ins)) return true;
+                Spec sb = mk(rv, ins, rv, ins);
+                add(sb, Ad + pu, a);
+                if (tryInterEv(sa, remEv[a], sb)) return true;
             }
         }
         for (int a = 1; a <= 2 && pu + a <= na; ++a)
             for (int b = 1; b <= 2 && pv + b <= nb; ++b) {
                 if (!segOk(rv, A, pu, a) || !segOk(ru, B, pv, b)) continue;
-                t1.assign(A.begin(), A.begin() + pu);
-                t1.insert(t1.end(), B.begin() + pv, B.begin() + pv + b);
-                t1.insert(t1.end(), A.begin() + pu + a, A.end());
-                t2.assign(B.begin(), B.begin() + pv);
-                t2.insert(t2.end(), A.begin() + pu, A.begin() + pu + a);
-                t2.insert(t2.end(), B.begin() + pv + b, B.end());
-                if (tryInter(ru, t1, pu, rv, t2, pv)) return true;
+                Spec sa = mk(ru, pu, ru, pu + a); add(sa, Bd + pv, b);
+                Spec sb = mk(rv, pv, rv, pv + b); add(sb, Ad + pu, a);
+                if (tryInterSpec(sa, sb)) return true;
             }
         // 2-opt*: tails after u and after v swapped
-        if (tailOk(rv, A, pu + 1) && tailOk(ru, B, pv + 1)) {
-            t1.assign(A.begin(), A.begin() + pu + 1);
-            t1.insert(t1.end(), B.begin() + pv + 1, B.end());
-            t2.assign(B.begin(), B.begin() + pv + 1);
-            t2.insert(t2.end(), A.begin() + pu + 1, A.end());
-            if (tryInter(ru, t1, pu + 1, rv, t2, pv + 1)) return true;
+        if (tailOk(rv, ru, pu + 1) && tailOk(ru, rv, pv + 1)) {
+            Spec sa = mk(ru, pu + 1, rv, pv + 1);
+            Spec sb = mk(rv, pv + 1, ru, pu + 1);
+            if (tryInterSpec(sa, sb)) return true;
         }
         // 2-opt*: u directly followed by v (and its tail)
-        if (tailOk(rv, A, pu + 1) && tailOk(ru, B, pv)) {
-            t1.assign(A.begin(), A.begin() + pu + 1);
-            t1.insert(t1.end(), B.begin() + pv, B.end());
-            t2.assign(B.begin(), B.begin() + pv);
-            t2.insert(t2.end(), A.begin() + pu + 1, A.end());
-            if (tryInter(ru, t1, pu + 1, rv, t2, pv)) return true;
+        if (tailOk(rv, ru, pu + 1) && tailOk(ru, rv, pv)) {
+            Spec sa = mk(ru, pu + 1, rv, pv);
+            Spec sb = mk(rv, pv, ru, pu + 1);
+            if (tryInterSpec(sa, sb)) return true;
         }
+        return false;
+    }
+
+    // non-granular intra-route relocation of the 1-2 task block at u to every position of its route
+    bool tryIntraAll(int u) {
+        int ru = rid[u], pu = idx[u];
+        const std::vector<int>& A = R[ru].seq;
+        const int* Ad = A.data();
+        int na = (int)A.size();
+        for (int a = 1; a <= 2 && pu + a <= na; ++a)
+            for (int ins = 0; ins + a <= na; ++ins) {
+                if (ins == pu) continue;
+                Spec s;
+                if (ins < pu) {
+                    s = mk(ru, ins, ru, pu + a);
+                    add(s, Ad + pu, a); add(s, Ad + ins, pu - ins);
+                } else {
+                    s = mk(ru, pu, ru, ins + a);
+                    add(s, Ad + pu + a, ins - pu); add(s, Ad + pu, a);
+                }
+                if (tryIntraSpec(s)) return true;
+            }
         return false;
     }
 
@@ -414,10 +631,9 @@ struct LS {
             stamp[m.twin[e]] = stampCtr;
             for (int a = 1; a <= 2 && pu + a <= na; ++a) {
                 if (!segOk(e, A, pu, a)) continue;
-                t1.assign(A.begin(), A.begin() + pu);
-                t1.insert(t1.end(), A.begin() + pu + a, A.end());
-                t2.assign(A.begin() + pu, A.begin() + pu + a);
-                if (tryInter(ru, t1, pu, e, t2, 0)) return true;
+                Spec sa = mk(ru, pu, ru, pu + a);
+                Spec sb = mk(e, 0, -1, 0); add(sb, A.data() + pu, a);
+                if (tryInterSpec(sa, sb)) return true;
             }
         }
         return false;
@@ -429,14 +645,14 @@ struct LS {
             for (int b = a + 1; b < m.V; ++b) {
                 if (R[a].seq.empty() && R[b].seq.empty()) continue;
                 if (m.twin[a] == m.twin[b] || m.vcls[a] < 0 || m.vcls[b] < 0) continue;
-                if (!tailOk(b, R[a].seq, 0) || !tailOk(a, R[b].seq, 0)) continue;
-                std::vector<int> sa = R[b].seq, sb = R[a].seq;
-                if (tryInter(a, sa, 0, b, sb, 0)) any = true;
+                if (!tailOk(b, a, 0) || !tailOk(a, b, 0)) continue;
+                Spec sa = mk(a, 0, -1, 0); add(sa, R[b].seq.data(), (int)R[b].seq.size());
+                Spec sb = mk(b, 0, -1, 0); add(sb, R[a].seq.data(), (int)R[a].seq.size());
+                if (tryInterSpec(sa, sb)) any = true;
             }
         return any;
     }
 
-    // returns true if completed (false if timed out)
     void run(const std::vector<int>& assigned) {
         order = assigned;
         bool improved = true;
@@ -450,13 +666,18 @@ struct LS {
                 do {
                     again = false;
                     const std::vector<int>& nb = m.nbr[u];
+                    size_t nbn = std::min(nb.size(), kLimit);
                     long long lt = lastTest[u];
                     lastTest[u] = ++ctr;
-                    for (size_t q = 0; q < nb.size(); ++q) {
+                    for (size_t q = 0; q < nbn; ++q) {
                         if (lt > std::max(modAt[rid[u]], modAt[rid[nb[q]]])) continue;
                         if (tryPair(u, nb[q])) { again = true; improved = true; break; }
                     }
                     if (!again && tryEmpty(u)) { again = true; improved = true; }
+                    if (!again && useIntraAll && lastIntra[u] <= modAt[rid[u]]) {
+                        lastIntra[u] = ++ctr;
+                        if (tryIntraAll(u)) { again = true; improved = true; }
+                    }
                 } while (again);
             }
             if (!timeUp && tryRouteSwaps()) improved = true;
@@ -485,7 +706,7 @@ struct Solver {
     double bestAt = 0;
     std::vector<TrajPoint> traj;
 
-    Solver(const Model& mm) : m(mm), par(mm.in.par), rng((uint64_t)mm.in.par.seed) {}
+    Solver(const Model& mm) : m(mm), par(mm.in.par), rng((uint64_t)mm.in.par.seed), ls(mm, rng) {}
 
     double elapsed() const { return std::chrono::duration<double>(Clock::now() - t0).count(); }
 
@@ -512,11 +733,13 @@ struct Solver {
         return (double)diff / std::max<size_t>(1, m.assigned.size());
     }
 
-    Indiv educate(const std::vector<int>& tour) {
-        std::vector<std::vector<int>> routes;
+    LS ls;
+    std::vector<std::vector<int>> splitBuf;
+    Indiv educate(const std::vector<int>& tour, bool initial) {
+        ls.kLimit = (size_t)par.granularK; (void)initial;
+        std::vector<std::vector<int>>& routes = splitBuf;
         m.split(tour, routes);
-        LS ls(m, rng, deadline);
-        ls.load(routes);
+        ls.load(routes, deadline);
         ls.run(m.assigned);
         std::vector<std::vector<int>> out(m.V);
         for (int v = 0; v < m.V; ++v) out[v] = ls.R[v].seq;
@@ -603,13 +826,38 @@ struct Solver {
     bool timeUp() const { return Clock::now() >= deadline; }
     bool iterUp() const { return par.maxIter > 0 && iter >= par.maxIter; }
 
+    // randomised nearest-neighbour giant tour (spatially coherent start for the local search)
+    std::vector<char> seen;
+    void nnTour(std::vector<int>& tour) {
+        std::vector<int> fall = m.assigned;
+        rng.shuffle(fall.begin(), fall.end());
+        seen.assign(m.T, 0);
+        tour.clear();
+        size_t fp = 0;
+        int cur = -1;
+        const int pickFrom = 3;
+        while (tour.size() < m.assigned.size()) {
+            int cand[pickFrom], nc = 0;
+            if (cur >= 0)
+                for (int y : m.nbr[cur]) { if (!seen[y]) { cand[nc++] = y; if (nc == pickFrom) break; } }
+            int nx;
+            if (nc > 0) nx = cand[rng.range(nc)];
+            else { while (seen[fall[fp]]) ++fp; nx = fall[fp]; }
+            seen[nx] = 1; tour.push_back(nx); cur = nx;
+        }
+    }
+
     void generateInitial() {
         int n0 = par.popInit > 0 ? par.popInit : 2 * par.popMin;
         std::vector<int> tour = m.assigned;
+        // The initial population may use at most ~20% of the time budget (but at least 4 individuals).
+        Clock::time_point initEnd = t0 + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(0.2 * par.timeLimit));
         for (int i = 0; i < n0 && !timeUp() && !iterUp(); ++i) {
-            rng.shuffle(tour.begin(), tour.end());
+            if (i >= 4 && Clock::now() >= initEnd) break;
+            if (i % 4 == 0) rng.shuffle(tour.begin(), tour.end());
+            else nnTour(tour);
             ++iter;
-            addToPop(educate(tour));
+            addToPop(educate(tour, true));
         }
     }
 
@@ -629,13 +877,13 @@ struct Solver {
             const Indiv& p2 = tournament();
             std::vector<int> child = crossoverOX(p1, p2);
             ++iter;
-            addToPop(educate(child));
+            addToPop(educate(child, false));
             if (best.cost < lastBest - 1e-9) { lastBest = best.cost; noImp = 0; }
             else if (++noImp >= par.maxIterNoImprove) {
                 if (best.cost < cycleStartBest - 1e-9) failedCycles = 0; else ++failedCycles;
                 cycleStartBest = best.cost;
                 // Deterministic termination: stop once restarts stop paying off
-                if (failedCycles >= 2) break;
+                if (par.stopOnStagnation && failedCycles >= 2) break;
                 pop.clear(); dist.clear(); noImp = 0;
                 if (par.verbose) std::fprintf(stderr, "[%.2fs] restart\n", elapsed());
                 generateInitial();

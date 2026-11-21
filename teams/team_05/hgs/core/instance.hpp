@@ -26,6 +26,7 @@ struct Params {
     int granularK = 20, nbElite = 4, nbClose = 5;
     int popInit = 0;          // 0 => auto
     long long maxIter = 0;    // 0 => unlimited (time limit only)
+    bool stopOnStagnation = false; // true iff max_iter_no_improve was given explicitly: then 2 failed restart cycles end the run
     bool verbose = false;
 };
 struct Instance {
